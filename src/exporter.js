@@ -4,6 +4,7 @@ const { listNotebooks, openNotebook, openNotebookByLink } = require('./navigator
 const { getSections, getPages, selectSection, selectPage, getPageContent, navigateBack, isSectionLocked } = require('./scrapers');
 const { createMarkdownConverter } = require('./parser');
 const { resolveInternalLinks } = require('./linkResolver');
+const { writePageOutputs, writeJsonOutputs } = require('./outputWriters');
 const { withRetry } = require('./utils/retry');
 const readline = require('readline');
 const fs = require('fs-extra');
@@ -62,7 +63,7 @@ function waitForEnter(message) {
     });
 }
 
-async function processSections(contentFrame, outputDir, td, options, pageIdMap, processedItems = new Set(), parentId = null, stats = { totalPages: 0, totalAssets: 0 }) {
+async function processSections(contentFrame, outputDir, td, options, pageIdMap, processedItems = new Set(), parentId = null, stats = { totalPages: 0, totalAssets: 0 }, outputBase = outputDir) {
     const sections = await getSections(contentFrame, parentId);
     if (sections.length === 0 && parentId) {
         logger.debug('(No items found in this group)');
@@ -95,7 +96,7 @@ async function processSections(contentFrame, outputDir, td, options, pageIdMap, 
                     const dumpPath = path.join(dumpDir, `debug_group_${sanitize(item.name)}.html`);
                     await fs.writeFile(dumpPath, await contentFrame.content());
                 }
-                await processSections(contentFrame, groupDir, td, options, pageIdMap, processedItems, item.id, stats);
+                await processSections(contentFrame, groupDir, td, options, pageIdMap, processedItems, item.id, stats, outputBase);
                 logger.info(`Returning from group: ${item.name}`);
                 await navigateBack(contentFrame);
                 logger.info('Will wait 3 seconds to let the frame load properly');
@@ -297,20 +298,17 @@ async function processSections(contentFrame, outputDir, td, options, pageIdMap, 
                     }
                 }
 
-                const markdown = td.turndown(updatedHtml);
-                const fileName = sanitizedNoteName + '.md';
-                const filePath = path.join(sectionDir, fileName);
-
-                // Store page in map for cross-linking (relative to output base)
-                pageIdMap[pageInfo.id] = {
-                    path: filePath,
-                    internalLinks: content.internalLinks,
-                    isDir: false
-                };
-
-                const finalContent = `${content.dateTime}\n\n${markdown}`;
-
-                await fs.writeFile(filePath, finalContent);
+                await writePageOutputs({
+                    pageIdMap,
+                    pageInfo,
+                    content,
+                    updatedHtml,
+                    sectionDir,
+                    outputBase,
+                    sanitizedNoteName,
+                    td,
+                    options
+                });
                 stats.totalPages++;
                 stats.totalAssets += savedResources;
                 logger.success(`Saved (${savedResources} assets)`);
@@ -382,10 +380,17 @@ async function runExport(options = {}) {
             logger.info('Resolving internal links...');
             await resolveInternalLinks(pageIdMap, outputBase);
 
+            if (options.json) {
+                logger.info('Writing JSON export...');
+                await writeJsonOutputs(pageIdMap, outputBase);
+            }
+
             logger.success('Export complete!');
             logger.info(`Total Pages: ${stats.totalPages}`);
             logger.info(`Total Assets: ${stats.totalAssets}`);
             logger.info(`Files saved in: ${outputBase}`);
+            if (options.html) logger.info('HTML saved in: <section>/_html/ inside each section folder');
+            if (options.json) logger.info('JSON saved in: <section>/_json/ inside each section folder');
             return;
         }
         // ────────────────────────────────────────────────────────────────────
@@ -482,10 +487,17 @@ async function runExport(options = {}) {
             logger.info('Resolving internal links...');
             await resolveInternalLinks(pageIdMap, outputBase);
 
+            if (options.json) {
+                logger.info('Writing JSON export...');
+                await writeJsonOutputs(pageIdMap, outputBase);
+            }
+
             logger.success('Export complete!');
             logger.info(`Total Pages: ${stats.totalPages}`);
             logger.info(`Total Assets: ${stats.totalAssets}`);
             logger.info(`Files saved in: ${outputBase}`);
+            if (options.html) logger.info('HTML saved in: <section>/_html/ inside each section folder');
+            if (options.json) logger.info('JSON saved in: <section>/_json/ inside each section folder');
         }
 
     } catch (e) {
@@ -517,7 +529,7 @@ async function runExportForElectron(options = {}, sendEvent, ipcMain) {
     const onDownloadError = (msg) => log('warn', `⚠ Asset skipped — ${msg}`);
 
     // ── Inline section processing adapted for Electron ──────────────────────
-    async function processSectionsElectron(contentFrame, outputDir, td, pageIdMap, processedItems = new Set(), parentId = null, stats) {
+    async function processSectionsElectron(contentFrame, outputDir, td, pageIdMap, processedItems = new Set(), parentId = null, stats, outputBase = outputDir) {
         const sections = await getSections(contentFrame, parentId);
         if (sections.length === 0 && parentId) {
             log('debug', '(No items found in this group)');
@@ -545,7 +557,7 @@ async function runExportForElectron(options = {}, sendEvent, ipcMain) {
                         const dumpPath = path.join(dumpDir, `debug_group_${sanitize(item.name)}.html`);
                         await fs.writeFile(dumpPath, await contentFrame.content());
                     }
-                    await processSectionsElectron(contentFrame, groupDir, td, pageIdMap, processedItems, item.id, stats);
+                    await processSectionsElectron(contentFrame, groupDir, td, pageIdMap, processedItems, item.id, stats, outputBase);
                     log('info', `Returning from group: ${item.name}`);
                     await navigateBack(contentFrame);
                     log('info', 'Will wait 3 seconds to let the page load properly');
@@ -695,12 +707,17 @@ async function runExportForElectron(options = {}, sendEvent, ipcMain) {
                         }
                     }
 
-                    const markdown = td.turndown(updatedHtml);
-                    const fileName = sanitizedNoteName + '.md';
-                    const filePath = path.join(sectionDir, fileName);
-                    pageIdMap[pageInfo.id] = { path: filePath, internalLinks: content.internalLinks, isDir: false };
-                    const finalContent = `${content.dateTime}\n\n${markdown}`;
-                    await fs.writeFile(filePath, finalContent);
+                    await writePageOutputs({
+                        pageIdMap,
+                        pageInfo,
+                        content,
+                        updatedHtml,
+                        sectionDir,
+                        outputBase,
+                        sanitizedNoteName,
+                        td,
+                        options
+                    });
                     stats.totalPages++;
                     stats.totalAssets += savedResources;
                     log('success', `Saved "${pageInfo.name}" (${savedResources} assets)`);
@@ -768,6 +785,13 @@ async function runExportForElectron(options = {}, sendEvent, ipcMain) {
 
             log('info', 'Resolving internal links...');
             await resolveInternalLinks(pageIdMap, outputBase);
+
+            if (options.json) {
+                log('info', 'Writing JSON export...');
+                await writeJsonOutputs(pageIdMap, outputBase);
+            }
+            if (options.html) log('info', 'HTML saved in: <section>/_html/ inside each section folder');
+            if (options.json) log('info', 'JSON saved in: <section>/_json/ inside each section folder');
 
             log('success', 'Export complete!');
             sendEvent('export-complete', { totalPages: stats.totalPages, totalAssets: stats.totalAssets, outputDir: outputBase });
@@ -846,6 +870,13 @@ async function runExportForElectron(options = {}, sendEvent, ipcMain) {
 
         log('info', 'Resolving internal links...');
         await resolveInternalLinks(pageIdMap, outputBase);
+
+        if (options.json) {
+            log('info', 'Writing JSON export...');
+            await writeJsonOutputs(pageIdMap, outputBase);
+        }
+        if (options.html) log('info', 'HTML saved in: <section>/_html/ inside each section folder');
+        if (options.json) log('info', 'JSON saved in: <section>/_json/ inside each section folder');
 
         log('success', 'Export complete!');
         sendEvent('export-complete', { totalPages: stats.totalPages, totalAssets: stats.totalAssets, outputDir: outputBase });
